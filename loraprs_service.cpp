@@ -7,6 +7,7 @@ byte Service::rxBuf_[CfgMaxPacketSize];
 #ifdef USE_RADIOLIB
 #pragma message("Using RadioLib")
 bool Service::interruptEnabled_ = true;
+volatile bool Service::loraDataAvailable_ = false;
 std::shared_ptr<MODULE_NAME> Service::radio_;
 #else
 #pragma message("Using arduino-LoRa")
@@ -24,12 +25,13 @@ Service::Service()
 {
 #ifdef USE_RADIOLIB
   interruptEnabled_ = true;
+  loraDataAvailable_ = false;
 #endif
 }
 
 void Service::setup(const Config &conf)
 {
-  config_ = conf;  
+  config_ = conf;
   previousBeaconMs_ = 0;
   disableKiss_ = conf.EnableTextPackets;
 
@@ -65,6 +67,10 @@ void Service::setup(const Config &conf)
   // peripherals, LoRa
   setupLora(config_.LoraFreq, config_.LoraBw, config_.LoraSf, 
     config_.LoraCodingRate, config_.LoraPower, config_.LoraSync, config_.LoraEnableCrc);
+
+#ifdef USE_RADIOLIB
+  xTaskCreate(processIncomingDataTask, "processIncomingDataTask", 10000, NULL, 1, NULL);
+#endif
 
   // peripherls, WiFi
   if (needsWifi()) {
@@ -207,7 +213,7 @@ void Service::setupLora(long loraFreq, long bw, int sf, int cr, int pwr, int syn
 
   radio_->clearDio0Action();
   radio_->setDio0Action(onLoraDataAvailableIsr);
-
+  
   state = radio_->startReceive();
   if (state != ERR_NONE) {
     LOG_ERROR("Receive start error:", state);
@@ -330,24 +336,36 @@ bool Service::isLoraRxBusy() {
 
 #ifdef USE_RADIOLIB
 
+void Service::processIncomingDataTask(void *param) {
+  LOG_INFO("Incoming data process task started");
+
+  while (true) {
+    if (loraDataAvailable_) {
+      int packetSize = radio_->getPacketLength();
+    
+      if (packetSize > 0) {
+    
+        int state = radio_->readData(rxBuf_, packetSize);
+        if (state == ERR_NONE) {
+          queueRigToSerialIsr(Cmd::Data, rxBuf_, packetSize);
+        } else {
+          LOG_ERROR("Read data error: ", state);
+        }
+    
+        state = radio_->startReceive();
+        if (state != ERR_NONE) {
+          LOG_ERROR("Start receive error: ", state);
+        }
+      }
+      loraDataAvailable_ = false;
+    }
+    delay(CfgPollDelayMs);
+  }
+}
+
 ICACHE_RAM_ATTR void Service::onLoraDataAvailableIsr() {
   if (interruptEnabled_) {
-    int packetSize = radio_->getPacketLength();
-  
-    if (packetSize > 0) {
-      
-      int state = radio_->readData(rxBuf_, packetSize);
-      if (state == ERR_NONE) {
-        queueRigToSerialIsr(Cmd::Data, rxBuf_, packetSize);
-      } else {
-        LOG_ERROR("Read data error: ", state);
-      }
-      
-      state = radio_->startReceive();
-      if (state != ERR_NONE) {
-        LOG_ERROR("Start receive error: ", state);
-      }
-    }
+    loraDataAvailable_ = true;
   }
 }
 
