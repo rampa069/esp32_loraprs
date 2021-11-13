@@ -6,6 +6,7 @@ byte Service::rxBuf_[CfgMaxPacketSize];
 
 #ifdef USE_RADIOLIB
 #pragma message("Using RadioLib")
+volatile bool Service::loraDataAvailable_ = false;
 bool Service::interruptEnabled_ = true;
 std::shared_ptr<MODULE_NAME> Service::radio_;
 #else
@@ -24,6 +25,7 @@ Service::Service()
 {
 #ifdef USE_RADIOLIB
   interruptEnabled_ = true;
+  loraDataAvailable_ = false;
 #endif
 }
 
@@ -38,6 +40,8 @@ void Service::setup(const Config &conf)
   // disable logging when USB is used for data transfer
   if (config_.UsbSerialEnable) {
     LOG_SET_LEVEL(DebugLogLevel::LVL_NONE);
+  } else {
+    LOG_SET_LEVEL(config_.LogLevel);
   }
 
   printConfig();
@@ -65,6 +69,13 @@ void Service::setup(const Config &conf)
   // peripherals, LoRa
   setupLora(config_.LoraFreq, config_.LoraBw, config_.LoraSf, 
     config_.LoraCodingRate, config_.LoraPower, config_.LoraSync, config_.LoraEnableCrc);
+
+#ifdef USE_RADIOLIB
+  if (!config_.LoraUseIsr) {
+    LOG_INFO("Reading data on separate task");
+    xTaskCreate(processIncomingDataTask, "processIncomingDataTask", 10000, NULL, 1, NULL);
+  }
+#endif
 
   // peripherls, WiFi
   if (needsWifi()) {
@@ -203,13 +214,25 @@ void Service::setupLora(long loraFreq, long bw, int sf, int cr, int pwr, int syn
   }
   radio_->setCRC(enableCrc);
   //radio_->forceLDRO(false);
-  #if (MODULE_NAME == SX1268)
-  radio_->setRfSwitchPins(4, 5);
-  radio_->clearDio1Action();
-  radio_->setDio1Action(onLoraDataAvailableIsr);
+  #ifdef USE_SX126X
+    #pragma message("Using SX126X")
+    LOG_INFO("Using SX126X module");
+    radio_->setRfSwitchPins(4, 5);
+    radio_->clearDio1Action();
+    if (config_.LoraUseIsr) {
+      radio_->setDio1Action(onLoraDataAvailableIsr);
+    } else {
+      radio_->setDio1Action(onLoraDataAvailableIsrNoRead);
+    }
   #else
-  radio_->clearDio0Action();
-  radio_->setDio0Action(onLoraDataAvailableIsr);
+    #pragma message("Using SX127X")
+    LOG_INFO("Using SX127X module");
+    radio_->clearDio0Action();
+    if (config_.LoraUseIsr) {
+      radio_->setDio0Action(onLoraDataAvailableIsr);
+    } else {
+      radio_->setDio0Action(onLoraDataAvailableIsrNoRead);
+    }
   #endif
 
   state = radio_->startReceive();
@@ -325,7 +348,7 @@ void Service::loop()
 }
 
 bool Service::isLoraRxBusy() {
-#if defined(USE_RADIOLIB) && !(MODULE_NAME == SX1268)
+#if defined(USE_RADIOLIB) && !defined(USE_SX126X)
   return config_.LoraUseCad && (radio_->getModemStatus() & 0x01); // SX1278_STATUS_SIG_DETECT
 #else
   return false;
@@ -333,6 +356,12 @@ bool Service::isLoraRxBusy() {
 }
 
 #ifdef USE_RADIOLIB
+
+ICACHE_RAM_ATTR void Service::onLoraDataAvailableIsrNoRead() {
+  if (interruptEnabled_) {
+    loraDataAvailable_ = true;
+  }
+}
 
 ICACHE_RAM_ATTR void Service::onLoraDataAvailableIsr() {
   if (interruptEnabled_) {
@@ -352,6 +381,33 @@ ICACHE_RAM_ATTR void Service::onLoraDataAvailableIsr() {
         LOG_ERROR("Start receive error: ", state);
       }
     }
+  }
+}
+
+void Service::processIncomingDataTask(void *param) {
+  LOG_INFO("Incoming data process task started");
+
+  while (true) {
+    if (loraDataAvailable_) {
+      int packetSize = radio_->getPacketLength();
+    
+      if (packetSize > 0) {
+    
+        int state = radio_->readData(rxBuf_, packetSize);
+        if (state == ERR_NONE) {
+          queueRigToSerialIsr(Cmd::Data, rxBuf_, packetSize);
+        } else {
+          LOG_ERROR("Read data error: ", state);
+        }
+    
+        state = radio_->startReceive();
+        if (state != ERR_NONE) {
+          LOG_ERROR("Start receive error: ", state);
+        }
+      }
+      loraDataAvailable_ = false;
+    }
+    delay(CfgPollDelayMs);
   }
 }
 
@@ -485,7 +541,7 @@ void Service::onRigPacket(void *packet, int packetLength)
 
 void Service::performFrequencyCorrection() {
 #ifdef USE_RADIOLIB
-  #if (MODULE_NAME == SX1268)
+  #ifdef USE_SX126X
   long frequencyErrorHz = 0;
   #else
   long frequencyErrorHz = radio_->getFrequencyError();
@@ -599,6 +655,7 @@ bool Service::onRigTxBegin()
 
 void Service::onRigTx(byte b)
 {
+  LOG_TRACE((char)b, String(b, HEX));
 #ifdef USE_RADIOLIB
   txQueue_.push(b);
 #else
@@ -662,6 +719,7 @@ void Service::attachKissNetworkClient()
 
 void Service::onSerialTx(byte b)
 {
+  LOG_TRACE((char)b, String(b, HEX));
   if (config_.UsbSerialEnable) {
     Serial.write(b);
   } 
@@ -716,6 +774,7 @@ bool Service::onSerialRx(byte *b)
     return false;
   }
   *b = (byte)rxResult;
+  LOG_TRACE((char)rxResult, String(rxResult, HEX));
   return true;
 }
 
@@ -746,6 +805,7 @@ void Service::onControlCommand(Cmd cmd, byte value)
 void Service::onRadioControlCommand(const std::vector<byte> &rawCommand) {
 
   if (config_.KissEnableExtensions && rawCommand.size() == sizeof(SetHardware)) {
+    LOG_INFO("Setting new radio parameters");
     const struct SetHardware * setHardware = reinterpret_cast<const struct SetHardware*>(rawCommand.data());
     
     config_.LoraFreq = be32toh(setHardware->freq);

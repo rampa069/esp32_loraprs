@@ -1,4 +1,5 @@
 #include <arduino-timer.h>
+#include <DebugLog.h>
 #include "WiFi.h"
 #include "loraprs_service.h"
 
@@ -18,6 +19,9 @@
 
 void initializeConfig(LoraPrs::Config &cfg) {
 
+  // log level
+  cfg.LogLevel = CFG_LOG_LEVEL;
+  
   // client/server mode switch
   cfg.IsClientMode = CFG_IS_CLIENT_MODE;
 
@@ -45,7 +49,7 @@ void initializeConfig(LoraPrs::Config &cfg) {
   cfg.AprsPass = CFG_APRS_PASS;
   cfg.AprsFilter = CFG_APRS_FILTER; // multiple filters are space separated
   cfg.AprsRawBeacon = CFG_APRS_RAW_BKN;
-  cfg.AprsRawBeaconPeriodMinutes = 20;
+  cfg.AprsRawBeaconPeriodMinutes = 5;
 
   // USB
   cfg.UsbSerialEnable = CFG_USB_SERIAL_ENABLE;
